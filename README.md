@@ -1,8 +1,83 @@
 # 🌌 **OmniSphere: Advanced YouTube Empire Automation System** 🌌
 
-[![Python](https://img.shields.io/badge/python-v3.9+-blue.svg)](https://www.python.org/downloads/)
-[![Status](https://img.shields.io/badge/status-production_ready-green.svg)]()
+[![Python](https://img.shields.io/badge/python-v3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Status](https://img.shields.io/badge/status-development-yellow.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)]()
+
+## 🚀 **Quick Start (Development Environment)**
+
+### Prerequisites
+- **Python 3.10-3.11** (recommended for widest library support)
+- **Git**
+- **Docker** (optional but recommended for local development)
+
+### 1. Setup Development Environment
+```bash
+# Clone the repository
+git clone <your-omnisphere-repo-url>
+cd omnisphere
+
+# Quick setup with Make (recommended)
+make init
+
+# Or manual setup:
+python3 -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+pip install --upgrade pip pip-tools
+pip install -r requirements.txt
+cp .env.template .env
+```
+
+### 2. Configure Environment Variables
+Edit the `.env` file with your API keys and configuration:
+```bash
+# Essential configuration
+OPENAI_API_KEY=sk-your-openai-api-key-here
+DATABASE_URL=postgresql://username:password@localhost:5432/omnisphere_db
+REDIS_URL=redis://localhost:6379/0
+
+# See .env.template for all available options
+```
+
+### 3. Development Options
+
+#### Option A: Local Development
+```bash
+# Start the development server
+make run
+# Or: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+#### Option B: Docker Development Stack
+```bash
+# Start all services (PostgreSQL, Redis, MongoDB, App, Monitoring)
+docker-compose up -d
+
+# View logs
+docker-compose logs -f omnisphere
+
+# Stop services
+docker-compose down
+```
+
+### 4. Development Commands
+```bash
+make help          # Show all available commands
+make test          # Run tests
+make lint          # Run linting (flake8, mypy, bandit)
+make format        # Format code (black, isort)
+make clean         # Clean cache files
+make status        # Show project status
+```
+
+### 🐳 **Free Deployment Options**
+- **GitHub Codespaces**: Click "Code" → "Codespaces" → "Create codespace"
+- **Replit**: Import from GitHub and configure environment
+- **Render**: Connect GitHub repo and deploy with Docker
+- **Railway**: Deploy with one-click Docker deployment
+- **Local Machine**: Full development environment
+
+---
 
 > **The most advanced, fully automated YouTube content creation and monetization system ever conceived.**
 
