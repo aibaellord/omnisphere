@@ -1,0 +1,198 @@
+name: 📢 Reusable Notifications
+
+on:
+  workflow_call:
+    inputs:
+      status:
+        description: 'Status of the workflow (success, failure, cancelled)'
+        required: true
+        type: string
+      workflow-name:
+        description: 'Name of the workflow'
+        required: true
+        type: string
+      details:
+        description: 'Additional details to include'
+        required: false
+        type: string
+        default: ''
+      slack-enabled:
+        description: 'Whether to send Slack notifications'
+        required: false
+        type: boolean
+        default: true
+      discord-enabled:
+        description: 'Whether to send Discord notifications'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      SLACK_WEBHOOK_URL:
+        required: false
+      DISCORD_WEBHOOK_URL:
+        required: false
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - name: 🎨 Prepare notification data
+      id: prepare
+      run: |
+        # Set emoji and color based on status
+        case "${{ inputs.status }}" in
+          "success")
+            echo "emoji=✅" >> $GITHUB_OUTPUT
+            echo "color=#28a745" >> $GITHUB_OUTPUT
+            echo "title=Success" >> $GITHUB_OUTPUT
+            ;;
+          "failure")
+            echo "emoji=❌" >> $GITHUB_OUTPUT
+            echo "color=#dc3545" >> $GITHUB_OUTPUT
+            echo "title=Failed" >> $GITHUB_OUTPUT
+            ;;
+          "cancelled")
+            echo "emoji=⚠️" >> $GITHUB_OUTPUT
+            echo "color=#ffc107" >> $GITHUB_OUTPUT
+            echo "title=Cancelled" >> $GITHUB_OUTPUT
+            ;;
+          *)
+            echo "emoji=ℹ️" >> $GITHUB_OUTPUT
+            echo "color=#17a2b8" >> $GITHUB_OUTPUT
+            echo "title=Info" >> $GITHUB_OUTPUT
+            ;;
+        esac
+        
+        # Prepare common fields
+        echo "timestamp=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
+        echo "run_url=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_OUTPUT
+
+    - name: 📢 Send Slack notification
+      if: ${{ inputs.slack-enabled && secrets.SLACK_WEBHOOK_URL != '' }}
+      run: |
+        # Build Slack payload
+        cat > slack_payload.json << 'EOF'
+        {
+          "username": "GitHub Actions Bot",
+          "icon_emoji": ":github:",
+          "attachments": [
+            {
+              "color": "${{ steps.prepare.outputs.color }}",
+              "title": "${{ steps.prepare.outputs.emoji }} ${{ inputs.workflow-name }} - ${{ steps.prepare.outputs.title }}",
+              "title_link": "${{ steps.prepare.outputs.run_url }}",
+              "fields": [
+                {
+                  "title": "Repository",
+                  "value": "${{ github.repository }}",
+                  "short": true
+                },
+                {
+                  "title": "Branch",
+                  "value": "${{ github.ref_name }}",
+                  "short": true
+                },
+                {
+                  "title": "Run Number",
+                  "value": "#${{ github.run_number }}",
+                  "short": true
+                },
+                {
+                  "title": "Triggered By",
+                  "value": "${{ github.actor }}",
+                  "short": true
+                }
+              ],
+              "footer": "GitHub Actions",
+              "ts": ${{ github.event.head_commit.timestamp && github.event.head_commit.timestamp || 'null' }}
+            }
+          ]
+        }
+        EOF
+        
+        # Add details if provided
+        if [ -n "${{ inputs.details }}" ]; then
+          jq '.attachments[0].fields += [{"title": "Details", "value": "${{ inputs.details }}", "short": false}]' slack_payload.json > slack_payload_with_details.json
+          mv slack_payload_with_details.json slack_payload.json
+        fi
+        
+        # Send to Slack
+        curl -X POST -H 'Content-type: application/json' \
+             --data @slack_payload.json \
+             "${{ secrets.SLACK_WEBHOOK_URL }}"
+        
+        echo "✅ Slack notification sent"
+
+    - name: 🎮 Send Discord notification
+      if: ${{ inputs.discord-enabled && secrets.DISCORD_WEBHOOK_URL != '' }}
+      run: |
+        # Build Discord embed
+        cat > discord_payload.json << 'EOF'
+        {
+          "username": "GitHub Actions",
+          "avatar_url": "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png",
+          "embeds": [
+            {
+              "title": "${{ steps.prepare.outputs.emoji }} ${{ inputs.workflow-name }} - ${{ steps.prepare.outputs.title }}",
+              "url": "${{ steps.prepare.outputs.run_url }}",
+              "color": "${{ steps.prepare.outputs.color == '#28a745' && '2664261' || steps.prepare.outputs.color == '#dc3545' && '14431557' || steps.prepare.outputs.color == '#ffc107' && '16761095' || '1675930' }}",
+              "fields": [
+                {
+                  "name": "📂 Repository",
+                  "value": "${{ github.repository }}",
+                  "inline": true
+                },
+                {
+                  "name": "🌿 Branch",
+                  "value": "${{ github.ref_name }}",
+                  "inline": true
+                },
+                {
+                  "name": "🔢 Run",
+                  "value": "#${{ github.run_number }}",
+                  "inline": true
+                },
+                {
+                  "name": "👤 Actor",
+                  "value": "${{ github.actor }}",
+                  "inline": true
+                }
+              ],
+              "timestamp": "${{ steps.prepare.outputs.timestamp }}",
+              "footer": {
+                "text": "GitHub Actions"
+              }
+            }
+          ]
+        }
+        EOF
+        
+        # Add details if provided
+        if [ -n "${{ inputs.details }}" ]; then
+          jq '.embeds[0].fields += [{"name": "📋 Details", "value": "${{ inputs.details }}", "inline": false}]' discord_payload.json > discord_payload_with_details.json
+          mv discord_payload_with_details.json discord_payload.json
+        fi
+        
+        # Send to Discord
+        curl -X POST -H 'Content-type: application/json' \
+             --data @discord_payload.json \
+             "${{ secrets.DISCORD_WEBHOOK_URL }}"
+        
+        echo "✅ Discord notification sent"
+
+    - name: 📧 Fallback notification
+      if: ${{ always() && secrets.SLACK_WEBHOOK_URL == '' && secrets.DISCORD_WEBHOOK_URL == '' }}
+      run: |
+        echo "⚠️ No webhook URLs configured. Add SLACK_WEBHOOK_URL or DISCORD_WEBHOOK_URL to repository secrets."
+        echo "## 📢 Notification Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- **Status**: ${{ steps.prepare.outputs.emoji }} ${{ steps.prepare.outputs.title }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Workflow**: ${{ inputs.workflow-name }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Repository**: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Run**: #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Actor**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Time**: ${{ steps.prepare.outputs.timestamp }}" >> $GITHUB_STEP_SUMMARY
+        if [ -n "${{ inputs.details }}" ]; then
+          echo "- **Details**: ${{ inputs.details }}" >> $GITHUB_STEP_SUMMARY
+        fi

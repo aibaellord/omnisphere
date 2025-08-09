@@ -1,0 +1,132 @@
+# Lifestyle-Focused YouTube Channel Configuration
+channel_id: lifestyle-vibes
+channel_name: "LifeStyle Vibes"
+
+# Platform Configuration
+platform:
+  youtube:
+    enabled: true
+    channel_id: "UCyyyyyyyyyyyyyyyyyyy"
+    upload_defaults:
+      privacy: "public"
+      category_id: 26  # Howto & Style
+      language: "en"
+      license: "youtube"
+      embeddable: true
+    scheduling:
+      upload_time: "14:00"  # 2 PM UTC
+      frequency: "3x_weekly"  # Mon, Wed, Fri
+      max_uploads_per_day: 1
+  
+  instagram:
+    enabled: true
+    username: "lifestylevibes_official"
+    upload_defaults:
+      privacy: "public"
+      allow_comments: true
+      hide_like_count: false
+    scheduling:
+      upload_time: "16:00"  # 4 PM UTC
+      frequency: "daily"
+      max_uploads_per_day: 2
+
+# Content Configuration
+content:
+  niche: "lifestyle"
+  target_audience: "millennial_women"
+  content_types:
+    - "morning_routines"
+    - "home_decor"
+    - "wellness_tips"
+    - "fashion_hauls"
+    - "productivity_hacks"
+  
+  video_specs:
+    youtube:
+      duration: [600, 1200]  # 10-20 minutes
+      resolution: "1920x1080"
+      fps: 30
+      format: "mp4"
+    instagram:
+      duration: [15, 60]  # 15s-1min for reels
+      resolution: "1080x1920"  # Vertical
+      fps: 30
+      format: "mp4"
+
+# SEO & Optimization
+seo:
+  keywords:
+    primary: ["lifestyle", "wellness", "self care", "home organization"]
+    secondary: ["morning routine", "productivity", "minimalism", "aesthetic"]
+  
+  hashtags:
+    youtube: ["#Lifestyle", "#Wellness", "#SelfCare", "#HomeDecor", "#Productivity"]
+    instagram: ["#LifestyleBlogger", "#WellnessJourney", "#Aesthetic", "#SelfCareRoutine", "#HomeVibes"]
+
+# Revenue Configuration
+monetization:
+  youtube:
+    ads_enabled: true
+    sponsorships: true
+    memberships: false
+    super_chat: false
+    merch_shelf: true
+  
+  affiliate_marketing:
+    enabled: true
+    networks: ["amazon_associates", "lifestyle_brands", "wellness_products"]
+  
+  digital_products:
+    enabled: true
+    products: ["planners", "guides", "presets"]
+
+# Compliance & Safety
+compliance:
+  content_policy:
+    copyright_check: true
+    profanity_filter: true
+    coppa_compliant: true
+    advertiser_friendly: true
+  
+  safety_checks:
+    - "copyright_detection"
+    - "profanity_check"
+    - "health_claims_check"
+  
+  upload_restrictions:
+    max_file_size: "2GB"
+    supported_formats: ["mp4", "mov"]
+    thumbnail_requirements:
+      resolution: "1280x720"
+      aspect_ratio: "16:9"
+      format: "jpg"
+
+# Analytics & Tracking
+analytics:
+  tracking_enabled: true
+  metrics_to_track:
+    - "view_count"
+    - "engagement_rate"
+    - "subscriber_growth"
+    - "revenue"
+    - "demographics"
+  
+  reporting:
+    frequency: "weekly"
+    dashboard_enabled: true
+    alerts:
+      low_engagement: true
+      brand_mentions: true
+
+# Worker Configuration for Scaling
+scaling:
+  worker_config:
+    max_concurrent_uploads: 2
+    queue_priority: "medium"
+    retry_attempts: 2
+    timeout: 180  # 3 minutes
+  
+  resource_limits:
+    memory_limit: "1GB"
+    cpu_limit: "1 core"
+    storage_limit: "20GB"

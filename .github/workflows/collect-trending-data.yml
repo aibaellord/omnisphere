@@ -1,0 +1,240 @@
+name: 🔥 Collect Trending Data
+
+on:
+  # Run hourly at :15 minutes past each hour
+  schedule:
+    - cron: '15 * * * *'
+  
+  # Allow manual triggering
+  workflow_dispatch:
+    inputs:
+      regions:
+        description: 'Comma-separated region codes (default: all)'
+        required: false
+        default: 'US,GB,CA,AU,DE,FR'
+      categories:
+        description: 'Comma-separated category IDs (default: all)'
+        required: false
+        default: '10,24,28,20,25'
+      max_results:
+        description: 'Max results per request (default: 50)'
+        required: false
+        default: '50'
+
+env:
+  PYTHON_VERSION: '3.10'
+
+jobs:
+  collect-trending:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+    - name: 📥 Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: 🔧 Setup Environment
+      uses: ./.github/workflows/reusable-setup.yml
+      with:
+        install-extras: 'google-api-python-client google-auth google-auth-oauthlib'
+    
+    - name: 📁 Create Data Directory
+      run: |
+        mkdir -p data/trending
+        mkdir -p logs
+    
+    - name: 🔑 Configure API Keys
+      run: |
+        # Set up YouTube API keys from secrets
+        echo "YOUTUBE_API_KEY_1=${{ secrets.YOUTUBE_API_KEY_1 }}" >> $GITHUB_ENV
+        echo "YOUTUBE_API_KEY_2=${{ secrets.YOUTUBE_API_KEY_2 }}" >> $GITHUB_ENV
+        echo "YOUTUBE_API_KEY_3=${{ secrets.YOUTUBE_API_KEY_3 }}" >> $GITHUB_ENV
+        echo "YOUTUBE_API_KEY=${{ secrets.YOUTUBE_API_KEY_1 }}" >> $GITHUB_ENV
+    
+    - name: 🚀 Run Trending Data Collection
+      run: |
+        python -c "
+        import asyncio
+        import os
+        import sys
+        sys.path.append('.')
+        from collect_trending import TrendingDataCollector
+        
+        async def run_collection():
+            # Get API keys
+            api_keys = []
+            for i in range(1, 6):
+                key = os.getenv(f'YOUTUBE_API_KEY_{i}')
+                if key and key not in api_keys:
+                    api_keys.append(key)
+            
+            if not api_keys:
+                print('❌ No API keys found')
+                return
+            
+            # Parse input parameters
+            regions = '${{ github.event.inputs.regions }}'.split(',') if '${{ github.event.inputs.regions }}' else None
+            categories = '${{ github.event.inputs.categories }}'.split(',') if '${{ github.event.inputs.categories }}' else None
+            max_results = int('${{ github.event.inputs.max_results }}') if '${{ github.event.inputs.max_results }}' else 50
+            
+            # Clean up region/category inputs
+            if regions:
+                regions = [r.strip() for r in regions if r.strip()]
+            if categories:
+                categories = [c.strip() for c in categories if c.strip()]
+            
+            # Initialize collector
+            collector = TrendingDataCollector(
+                api_keys=api_keys,
+                db_path='trending_data.db',
+                data_dir='./data/trending'
+            )
+            
+            # Run collection
+            print(f'🚀 Starting collection with {len(api_keys)} API keys')
+            if regions:
+                print(f'🌍 Regions: {regions}')
+            if categories:
+                print(f'📂 Categories: {categories}')
+            
+            results = await collector.collect_trending_data(
+                regions=regions,
+                categories=categories,
+                max_results_per_request=max_results
+            )
+            
+            print(f'✅ Collection completed: {results[\"total_videos_collected\"]} videos')
+            return results
+        
+        asyncio.run(run_collection())
+        "
+    
+    - name: 📊 Generate Collection Report
+      id: report
+      run: |
+        python -c "
+        import sqlite3
+        import json
+        from datetime import datetime, timedelta
+        
+        # Connect to database and get latest stats
+        conn = sqlite3.connect('trending_data.db')
+        cursor = conn.cursor()
+        
+        # Get latest collection stats
+        cursor.execute('''
+        SELECT batch_id, collection_date, total_videos, success_rate, processing_time_seconds, api_requests_made
+        FROM collection_stats 
+        ORDER BY collection_date DESC 
+        LIMIT 1
+        ''')
+        
+        result = cursor.fetchone()
+        if result:
+            batch_id, date, videos, success_rate, time_sec, requests = result
+            print(f'📦 Batch: {batch_id}')
+            print(f'🎥 Videos: {videos}')
+            print(f'📈 Success: {success_rate:.1f}%')
+            print(f'⏱️  Time: {time_sec:.1f}s')
+            print(f'🔥 Requests: {requests}')
+            
+            # Set output for next step
+            with open('collection_report.txt', 'w') as f:
+                f.write(f'Batch: {batch_id}\n')
+                f.write(f'Videos: {videos}\n')
+                f.write(f'Success: {success_rate:.1f}%\n')
+                f.write(f'Time: {time_sec:.1f}s\n')
+                f.write(f'Requests: {requests}\n')
+        
+        conn.close()
+        "
+    
+    - name: 📤 Upload Data Artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: trending-data-${{ github.run_id }}
+        path: |
+          data/trending/*.json
+          trending_data.db
+          trending_collector.log
+          collection_report.txt
+        retention-days: 30
+    
+    - name: ☁️ Upload to Cloudflare R2 (Optional)
+      if: success() && vars.CLOUDFLARE_R2_ENABLED == 'true'
+      run: |
+        # Install AWS CLI for S3-compatible uploads
+        pip install awscli
+        
+        # Configure AWS CLI for Cloudflare R2
+        aws configure set aws_access_key_id ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY }}
+        aws configure set aws_secret_access_key ${{ secrets.CLOUDFLARE_R2_SECRET_KEY }}
+        aws configure set default.region auto
+        
+        # Upload latest JSON files to R2
+        DATE=$(date +%Y-%m-%d)
+        aws s3 sync data/trending/ s3://${{ vars.CLOUDFLARE_R2_BUCKET }}/trending/${DATE}/ \
+          --endpoint-url ${{ vars.CLOUDFLARE_R2_ENDPOINT }} \
+          --exclude "*" \
+          --include "*.json"
+        
+        echo "✅ Data uploaded to Cloudflare R2"
+    
+    - name: 💾 Commit Database Updates
+      if: success()
+      run: |
+        # Configure git
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        
+        # Add database file if it has changes
+        if [[ -f trending_data.db ]]; then
+          git add trending_data.db
+          
+          # Only commit if there are changes
+          if ! git diff --cached --quiet; then
+            git commit -m "📊 Auto-update trending data $(date -u '+%Y-%m-%d %H:%M UTC')" || echo "No changes to commit"
+            git push origin main || echo "Push failed - continuing anyway"
+          else
+            echo "No database changes to commit"
+          fi
+        fi
+    
+    - name: 📈 Update Collection Status
+      if: always()
+      run: |
+        STATUS="success"
+        if [[ "${{ job.status }}" != "success" ]]; then
+          STATUS="failed"
+        fi
+        
+        echo "Collection status: $STATUS" >> $GITHUB_STEP_SUMMARY
+        
+        # Add report to summary if available
+        if [[ -f collection_report.txt ]]; then
+          echo "## 📊 Collection Report" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat collection_report.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        fi
+    
+    - name: 🚨 Notify on Failure
+      if: failure() && vars.SLACK_WEBHOOK_URL != ''
+      run: |
+        curl -X POST -H 'Content-type: application/json' \
+          --data '{"text":"🚨 Trending Data Collection Failed\nWorkflow: ${{ github.workflow }}\nRun: ${{ github.run_number }}\nTime: $(date -u)"}' \
+          ${{ vars.SLACK_WEBHOOK_URL }}
+
+# Security: Only allow specific people to manually trigger
+concurrency:
+  group: trending-collection
+  cancel-in-progress: false

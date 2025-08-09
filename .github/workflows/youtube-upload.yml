@@ -1,0 +1,823 @@
+name: 🚀 YouTube Upload & Scheduling
+
+on:
+  # Manual triggering for video uploads
+  workflow_dispatch:
+    inputs:
+      video_file:
+        description: 'Path to MP4 video file (relative to repo root)'
+        required: true
+        type: string
+      thumbnail_file:
+        description: 'Path to thumbnail image (optional)'
+        required: false
+        type: string
+      title:
+        description: 'Video title'
+        required: true
+        type: string
+      description:
+        description: 'Video description'
+        required: false
+        type: string
+        default: ''
+      tags:
+        description: 'Video tags (comma-separated)'
+        required: false
+        type: string
+        default: ''
+      privacy:
+        description: 'Privacy setting'
+        required: false
+        type: choice
+        options:
+          - 'public'
+          - 'private'
+          - 'unlisted'
+        default: 'public'
+      scheduled_time:
+        description: 'Schedule time (YYYY-MM-DD HH:MM, leave empty for immediate)'
+        required: false
+        type: string
+      playlist_id:
+        description: 'Playlist ID to add video to (optional)'
+        required: false
+        type: string
+      retry_count:
+        description: 'Number of retry attempts on failure'
+        required: false
+        type: number
+        default: 3
+
+  # Scheduled uploads (check for pending videos every hour)
+  schedule:
+    - cron: '0 * * * *'  # Run every hour
+
+env:
+  PYTHON_VERSION: '3.10'
+
+jobs:
+  youtube-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    
+    steps:
+    - name: 📥 Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: 📦 Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install youtube-upload google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client
+        pip install requests retrying sqlalchemy python-dateutil
+        
+        # Verify youtube-upload installation
+        youtube-upload --version || echo "youtube-upload installed but version check failed"
+    
+    - name: 📁 Create Required Directories
+      run: |
+        mkdir -p uploads/processing
+        mkdir -p uploads/completed
+        mkdir -p uploads/failed
+        mkdir -p logs
+    
+    - name: 🔑 Configure Google OAuth Credentials
+      run: |
+        # Create OAuth credentials file from secrets
+        echo '${{ secrets.GOOGLE_OAUTH_CREDENTIALS }}' > oauth_credentials.json
+        
+        # Verify credentials file is valid JSON
+        python -c "import json; json.load(open('oauth_credentials.json'))" && echo "✅ OAuth credentials valid"
+        
+        # Set up refresh token if available
+        if [ ! -z "${{ secrets.GOOGLE_REFRESH_TOKEN }}" ]; then
+          echo "Setting up refresh token..."
+          echo '${{ secrets.GOOGLE_REFRESH_TOKEN }}' > refresh_token.json
+        fi
+    
+    - name: 🎬 Process Upload Request
+      id: upload_video
+      run: |
+        python << 'EOF'
+        import os
+        import json
+        import sys
+        import time
+        import sqlite3
+        import subprocess
+        from datetime import datetime, timedelta
+        from typing import Dict, Optional, List
+        import logging
+        from retrying import retry
+        import requests
+        from pathlib import Path
+
+        # Configure logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.StreamHandler(),
+                logging.FileHandler('logs/youtube_upload.log')
+            ]
+        )
+        logger = logging.getLogger(__name__)
+
+        class YouTubeUploadManager:
+            """Manages YouTube video uploads with retry logic and database tracking"""
+            
+            def __init__(self):
+                self.db_path = "youtube_uploads.db"
+                self.setup_database()
+                self.max_retries = int(os.getenv('RETRY_COUNT', '3'))
+                
+            def setup_database(self):
+                """Setup database to track upload history and metadata"""
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                
+                # Videos table - stores all video upload information
+                cursor.execute('''
+                CREATE TABLE IF NOT EXISTS youtube_videos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    video_id TEXT UNIQUE,          -- YouTube video ID returned after upload
+                    local_file_path TEXT NOT NULL,  -- Original video file path
+                    thumbnail_path TEXT,           -- Thumbnail file path
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    tags TEXT,                     -- JSON array of tags
+                    privacy_status TEXT DEFAULT 'public',
+                    scheduled_time DATETIME,       -- When to publish (NULL = immediate)
+                    playlist_id TEXT,             -- Playlist to add to
+                    upload_status TEXT DEFAULT 'pending',  -- pending, processing, completed, failed
+                    upload_attempts INTEGER DEFAULT 0,
+                    last_attempt_time DATETIME,
+                    error_message TEXT,
+                    video_url TEXT,               -- Full YouTube URL
+                    view_count INTEGER DEFAULT 0,
+                    like_count INTEGER DEFAULT 0,
+                    comment_count INTEGER DEFAULT 0,
+                    duration_seconds INTEGER,
+                    file_size_bytes INTEGER,
+                    upload_time DATETIME,         -- When upload actually completed
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                ''')
+                
+                # Upload sessions table - tracks each upload attempt
+                cursor.execute('''
+                CREATE TABLE IF NOT EXISTS upload_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    video_record_id INTEGER,
+                    session_start DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    session_end DATETIME,
+                    attempt_number INTEGER,
+                    status TEXT,  -- started, completed, failed, timeout
+                    error_code TEXT,
+                    error_message TEXT,
+                    retry_after_seconds INTEGER,
+                    FOREIGN KEY (video_record_id) REFERENCES youtube_videos (id)
+                )
+                ''')
+                
+                # Create indexes for better performance
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_video_status ON youtube_videos (upload_status)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_scheduled_time ON youtube_videos (scheduled_time)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_video_id ON youtube_videos (video_id)')
+                
+                conn.commit()
+                conn.close()
+                logger.info("✅ Database setup complete")
+            
+            def add_video_upload_request(self, video_data: Dict) -> int:
+                """Add a new video upload request to the database"""
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                
+                # Parse scheduled time if provided
+                scheduled_time = None
+                if video_data.get('scheduled_time'):
+                    try:
+                        scheduled_time = datetime.strptime(
+                            video_data['scheduled_time'], 
+                            '%Y-%m-%d %H:%M'
+                        )
+                    except ValueError:
+                        logger.warning(f"Invalid scheduled time format: {video_data.get('scheduled_time')}")
+                
+                cursor.execute('''
+                INSERT INTO youtube_videos (
+                    local_file_path, thumbnail_path, title, description, tags,
+                    privacy_status, scheduled_time, playlist_id, file_size_bytes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    video_data['video_file'],
+                    video_data.get('thumbnail_file'),
+                    video_data['title'],
+                    video_data.get('description', ''),
+                    json.dumps(video_data.get('tags', [])),
+                    video_data.get('privacy', 'public'),
+                    scheduled_time,
+                    video_data.get('playlist_id'),
+                    self._get_file_size(video_data['video_file'])
+                ))
+                
+                record_id = cursor.lastrowid
+                conn.commit()
+                conn.close()
+                
+                logger.info(f"✅ Video upload request added with ID: {record_id}")
+                return record_id
+            
+            def _get_file_size(self, file_path: str) -> int:
+                """Get file size in bytes"""
+                try:
+                    return os.path.getsize(file_path) if os.path.exists(file_path) else 0
+                except:
+                    return 0
+            
+            @retry(
+                stop_max_attempt_number=3,
+                wait_exponential_multiplier=1000,  # Start with 1 second
+                wait_exponential_max=60000,        # Max 60 seconds between retries
+                retry_on_exception=lambda ex: isinstance(ex, (subprocess.CalledProcessError, requests.RequestException))
+            )
+            def upload_video(self, record_id: int) -> Dict:
+                """Upload a video to YouTube with retry logic"""
+                
+                # Get video record
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute('SELECT * FROM youtube_videos WHERE id = ?', (record_id,))
+                record = cursor.fetchone()
+                conn.close()
+                
+                if not record:
+                    raise Exception(f"Video record {record_id} not found")
+                
+                # Parse record into dict for easier access
+                columns = [desc[0] for desc in cursor.description]
+                video_data = dict(zip(columns, record))
+                
+                logger.info(f"🚀 Starting upload for: {video_data['title']}")
+                
+                # Create upload session record
+                session_id = self._create_upload_session(record_id, video_data['upload_attempts'] + 1)
+                
+                try:
+                    # Check if scheduled upload time has arrived
+                    if video_data['scheduled_time']:
+                        scheduled = datetime.fromisoformat(video_data['scheduled_time'])
+                        if datetime.now() < scheduled:
+                            logger.info(f"⏰ Upload scheduled for {scheduled}, skipping for now")
+                            return {'status': 'scheduled', 'message': 'Upload time not yet reached'}
+                    
+                    # Build youtube-upload command
+                    upload_cmd = self._build_upload_command(video_data)
+                    
+                    logger.info(f"🎬 Executing upload command...")
+                    logger.debug(f"Command: {' '.join(upload_cmd[:5])}... (credentials hidden)")
+                    
+                    # Execute upload with timeout
+                    result = subprocess.run(
+                        upload_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=1800,  # 30 minute timeout
+                        check=True
+                    )
+                    
+                    # Parse video ID from output
+                    video_id = self._extract_video_id(result.stdout)
+                    
+                    if video_id:
+                        # Update record with successful upload
+                        self._update_upload_success(record_id, video_id, session_id)
+                        
+                        # Add to playlist if specified
+                        if video_data['playlist_id']:
+                            self._add_to_playlist(video_id, video_data['playlist_id'])
+                        
+                        logger.info(f"✅ Upload successful! Video ID: {video_id}")
+                        return {
+                            'status': 'success',
+                            'video_id': video_id,
+                            'video_url': f'https://youtube.com/watch?v={video_id}'
+                        }
+                    else:
+                        raise Exception("Failed to extract video ID from upload response")
+                
+                except subprocess.TimeoutExpired:
+                    error_msg = "Upload timeout after 30 minutes"
+                    logger.error(f"❌ {error_msg}")
+                    self._update_upload_failure(record_id, session_id, "TIMEOUT", error_msg)
+                    raise Exception(error_msg)
+                
+                except subprocess.CalledProcessError as e:
+                    error_msg = f"Upload failed: {e.stderr or e.stdout or str(e)}"
+                    
+                    # Check for specific error types and set retry delay
+                    retry_delay = self._parse_error_for_retry_delay(e.stderr or e.stdout or str(e))
+                    
+                    logger.error(f"❌ {error_msg}")
+                    self._update_upload_failure(record_id, session_id, e.returncode, error_msg, retry_delay)
+                    
+                    # Re-raise to trigger retry logic
+                    raise
+                
+                except Exception as e:
+                    error_msg = f"Unexpected error: {str(e)}"
+                    logger.error(f"❌ {error_msg}")
+                    self._update_upload_failure(record_id, session_id, "UNKNOWN", error_msg)
+                    raise
+            
+            def _build_upload_command(self, video_data: Dict) -> List[str]:
+                """Build youtube-upload command with all parameters"""
+                cmd = [
+                    'youtube-upload',
+                    '--client-secrets=oauth_credentials.json'
+                ]
+                
+                # Add refresh token if available
+                if os.path.exists('refresh_token.json'):
+                    cmd.extend(['--credentials-file=refresh_token.json'])
+                
+                # Video file
+                cmd.append(video_data['local_file_path'])
+                
+                # Title and description
+                cmd.extend(['--title', video_data['title']])
+                if video_data['description']:
+                    cmd.extend(['--description', video_data['description']])
+                
+                # Tags
+                if video_data['tags']:
+                    try:
+                        tags = json.loads(video_data['tags'])
+                        if tags:
+                            cmd.extend(['--tags', ','.join(tags)])
+                    except:
+                        pass
+                
+                # Privacy
+                privacy_map = {
+                    'public': 'public',
+                    'private': 'private', 
+                    'unlisted': 'unlisted'
+                }
+                privacy = privacy_map.get(video_data['privacy_status'], 'public')
+                cmd.extend(['--privacy', privacy])
+                
+                # Thumbnail
+                if video_data['thumbnail_path'] and os.path.exists(video_data['thumbnail_path']):
+                    cmd.extend(['--thumbnail', video_data['thumbnail_path']])
+                
+                # Scheduled publishing
+                if video_data['scheduled_time'] and privacy != 'private':
+                    # Convert to ISO format for YouTube API
+                    scheduled = datetime.fromisoformat(video_data['scheduled_time'])
+                    iso_time = scheduled.isoformat() + 'Z'
+                    cmd.extend(['--publish-at', iso_time])
+                
+                return cmd
+            
+            def _extract_video_id(self, upload_output: str) -> Optional[str]:
+                """Extract YouTube video ID from upload command output"""
+                import re
+                
+                # Try multiple patterns to extract video ID
+                patterns = [
+                    r'Video ID: ([a-zA-Z0-9_-]{11})',
+                    r'youtube\.com/watch\?v=([a-zA-Z0-9_-]{11})',
+                    r'youtu\.be/([a-zA-Z0-9_-]{11})',
+                    r'ID: ([a-zA-Z0-9_-]{11})',
+                    r'([a-zA-Z0-9_-]{11})'  # Last resort - any 11-char ID-like string
+                ]
+                
+                for pattern in patterns:
+                    match = re.search(pattern, upload_output)
+                    if match:
+                        video_id = match.group(1)
+                        # Validate it looks like a YouTube video ID
+                        if len(video_id) == 11 and re.match(r'^[a-zA-Z0-9_-]+$', video_id):
+                            return video_id
+                
+                logger.warning(f"Could not extract video ID from output: {upload_output[:500]}")
+                return None
+            
+            def _parse_error_for_retry_delay(self, error_output: str) -> int:
+                """Parse error message to determine appropriate retry delay"""
+                error_lower = error_output.lower()
+                
+                if '403' in error_output or 'quota' in error_lower:
+                    # Quota exceeded - wait longer
+                    return 3600  # 1 hour
+                elif '429' in error_output or 'rate limit' in error_lower:
+                    # Rate limit - standard backoff
+                    return 300   # 5 minutes
+                elif '500' in error_output or 'internal server error' in error_lower:
+                    # Server error - moderate wait
+                    return 120   # 2 minutes
+                elif '502' in error_output or '503' in error_output or '504' in error_output:
+                    # Service issues - moderate wait  
+                    return 180   # 3 minutes
+                else:
+                    # Generic error - short wait
+                    return 60    # 1 minute
+            
+            def _create_upload_session(self, video_record_id: int, attempt_number: int) -> int:
+                """Create a new upload session record"""
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                
+                cursor.execute('''
+                INSERT INTO upload_sessions (video_record_id, attempt_number, status)
+                VALUES (?, ?, 'started')
+                ''', (video_record_id, attempt_number))
+                
+                session_id = cursor.lastrowid
+                conn.commit()
+                conn.close()
+                return session_id
+            
+            def _update_upload_success(self, record_id: int, video_id: str, session_id: int):
+                """Update records for successful upload"""
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                
+                # Update main video record
+                cursor.execute('''
+                UPDATE youtube_videos 
+                SET video_id = ?, 
+                    upload_status = 'completed',
+                    video_url = ?,
+                    upload_time = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                ''', (video_id, f'https://youtube.com/watch?v={video_id}', record_id))
+                
+                # Update session record
+                cursor.execute('''
+                UPDATE upload_sessions 
+                SET status = 'completed', session_end = CURRENT_TIMESTAMP
+                WHERE id = ?
+                ''', (session_id,))
+                
+                conn.commit()
+                conn.close()
+            
+            def _update_upload_failure(self, record_id: int, session_id: int, error_code: str, error_msg: str, retry_delay: int = 60):
+                """Update records for failed upload"""
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                
+                # Update main video record
+                cursor.execute('''
+                UPDATE youtube_videos 
+                SET upload_status = 'failed',
+                    upload_attempts = upload_attempts + 1,
+                    last_attempt_time = CURRENT_TIMESTAMP,
+                    error_message = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                ''', (error_msg, record_id))
+                
+                # Update session record
+                cursor.execute('''
+                UPDATE upload_sessions 
+                SET status = 'failed',
+                    session_end = CURRENT_TIMESTAMP,
+                    error_code = ?,
+                    error_message = ?,
+                    retry_after_seconds = ?
+                WHERE id = ?
+                ''', (str(error_code), error_msg, retry_delay, session_id))
+                
+                conn.commit()
+                conn.close()
+            
+            def _add_to_playlist(self, video_id: str, playlist_id: str):
+                """Add video to specified playlist"""
+                try:
+                    cmd = [
+                        'youtube-upload',
+                        '--client-secrets=oauth_credentials.json',
+                        '--add-to-playlist', playlist_id,
+                        video_id
+                    ]
+                    
+                    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                    logger.info(f"✅ Video added to playlist: {playlist_id}")
+                    
+                except subprocess.CalledProcessError as e:
+                    logger.warning(f"Failed to add video to playlist: {e.stderr or e.stdout}")
+            
+            def get_pending_uploads(self) -> List[Dict]:
+                """Get videos that are ready for upload"""
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                
+                # Get videos that are pending and either unscheduled or past their schedule time
+                cursor.execute('''
+                SELECT * FROM youtube_videos 
+                WHERE upload_status = 'pending'
+                AND (scheduled_time IS NULL OR scheduled_time <= CURRENT_TIMESTAMP)
+                AND upload_attempts < ?
+                ORDER BY created_at ASC
+                ''', (self.max_retries,))
+                
+                results = cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description]
+                
+                videos = []
+                for row in results:
+                    videos.append(dict(zip(columns, row)))
+                
+                conn.close()
+                return videos
+
+        # Main execution logic
+        def main():
+            manager = YouTubeUploadManager()
+            
+            # Check if this is a manual upload or scheduled check
+            video_file = os.getenv('VIDEO_FILE', '${{ github.event.inputs.video_file }}')
+            
+            if video_file and video_file != '':
+                # Manual upload request
+                logger.info("🎬 Processing manual upload request")
+                
+                video_data = {
+                    'video_file': video_file,
+                    'thumbnail_file': os.getenv('THUMBNAIL_FILE', '${{ github.event.inputs.thumbnail_file }}'),
+                    'title': os.getenv('VIDEO_TITLE', '${{ github.event.inputs.title }}'),
+                    'description': os.getenv('VIDEO_DESCRIPTION', '${{ github.event.inputs.description }}'),
+                    'tags': os.getenv('VIDEO_TAGS', '${{ github.event.inputs.tags }}').split(',') if os.getenv('VIDEO_TAGS') else [],
+                    'privacy': os.getenv('PRIVACY', '${{ github.event.inputs.privacy }}'),
+                    'scheduled_time': os.getenv('SCHEDULED_TIME', '${{ github.event.inputs.scheduled_time }}'),
+                    'playlist_id': os.getenv('PLAYLIST_ID', '${{ github.event.inputs.playlist_id }}')
+                }
+                
+                # Validate required inputs
+                if not os.path.exists(video_data['video_file']):
+                    logger.error(f"❌ Video file not found: {video_data['video_file']}")
+                    sys.exit(1)
+                
+                # Add to database and upload
+                record_id = manager.add_video_upload_request(video_data)
+                result = manager.upload_video(record_id)
+                
+                # Set GitHub Action outputs
+                if result['status'] == 'success':
+                    print(f"::set-output name=video_id::{result['video_id']}")
+                    print(f"::set-output name=video_url::{result['video_url']}")
+                    print(f"::set-output name=upload_status::success")
+                else:
+                    print(f"::set-output name=upload_status::{result['status']}")
+                    print(f"::set-output name=error_message::{result.get('message', 'Unknown error')}")
+                
+            else:
+                # Scheduled check for pending uploads
+                logger.info("⏰ Checking for scheduled uploads")
+                
+                pending_videos = manager.get_pending_uploads()
+                
+                if not pending_videos:
+                    logger.info("📭 No pending uploads found")
+                    return
+                
+                logger.info(f"📋 Found {len(pending_videos)} pending uploads")
+                
+                uploaded_count = 0
+                failed_count = 0
+                
+                for video in pending_videos[:5]:  # Process up to 5 videos per run
+                    try:
+                        result = manager.upload_video(video['id'])
+                        if result['status'] == 'success':
+                            uploaded_count += 1
+                            logger.info(f"✅ Uploaded: {video['title']} -> {result['video_id']}")
+                        else:
+                            logger.warning(f"⏸️  Skipped: {video['title']} ({result['status']})")
+                    except Exception as e:
+                        failed_count += 1
+                        logger.error(f"❌ Failed: {video['title']} - {str(e)}")
+                        
+                        # Wait before next attempt to avoid rate limits
+                        if failed_count < len(pending_videos):
+                            time.sleep(30)
+                
+                logger.info(f"📊 Upload batch complete: {uploaded_count} successful, {failed_count} failed")
+                
+                # Set outputs for batch processing
+                print(f"::set-output name=uploaded_count::{uploaded_count}")
+                print(f"::set-output name=failed_count::{failed_count}")
+                print(f"::set-output name=total_processed::{uploaded_count + failed_count}")
+
+        if __name__ == "__main__":
+            main()
+
+        EOF
+      env:
+        VIDEO_FILE: ${{ github.event.inputs.video_file }}
+        THUMBNAIL_FILE: ${{ github.event.inputs.thumbnail_file }}
+        VIDEO_TITLE: ${{ github.event.inputs.title }}
+        VIDEO_DESCRIPTION: ${{ github.event.inputs.description }}
+        VIDEO_TAGS: ${{ github.event.inputs.tags }}
+        PRIVACY: ${{ github.event.inputs.privacy }}
+        SCHEDULED_TIME: ${{ github.event.inputs.scheduled_time }}
+        PLAYLIST_ID: ${{ github.event.inputs.playlist_id }}
+        RETRY_COUNT: ${{ github.event.inputs.retry_count }}
+
+    - name: 📊 Generate Upload Report
+      if: always()
+      run: |
+        python << 'EOF'
+        import sqlite3
+        import json
+        from datetime import datetime, timedelta
+        
+        def generate_upload_report():
+            try:
+                conn = sqlite3.connect('youtube_uploads.db')
+                cursor = conn.cursor()
+                
+                # Get recent upload statistics
+                cursor.execute('''
+                SELECT 
+                    upload_status,
+                    COUNT(*) as count,
+                    AVG(upload_attempts) as avg_attempts
+                FROM youtube_videos 
+                WHERE created_at >= datetime('now', '-24 hours')
+                GROUP BY upload_status
+                ''')
+                
+                stats = cursor.fetchall()
+                
+                # Get recent successful uploads
+                cursor.execute('''
+                SELECT title, video_id, upload_time, video_url
+                FROM youtube_videos 
+                WHERE upload_status = 'completed' 
+                AND upload_time >= datetime('now', '-24 hours')
+                ORDER BY upload_time DESC 
+                LIMIT 10
+                ''')
+                
+                recent_uploads = cursor.fetchall()
+                
+                # Get failed uploads that need attention
+                cursor.execute('''
+                SELECT title, error_message, upload_attempts, last_attempt_time
+                FROM youtube_videos 
+                WHERE upload_status = 'failed' 
+                AND upload_attempts >= 3
+                ORDER BY last_attempt_time DESC 
+                LIMIT 5
+                ''')
+                
+                failed_uploads = cursor.fetchall()
+                
+                # Generate report
+                report = "## 🎬 YouTube Upload Report\n\n"
+                
+                if stats:
+                    report += "### 📊 Upload Statistics (Last 24 Hours)\n"
+                    for status, count, avg_attempts in stats:
+                        report += f"- **{status.title()}**: {count} videos (avg {avg_attempts:.1f} attempts)\n"
+                    report += "\n"
+                
+                if recent_uploads:
+                    report += "### ✅ Recent Successful Uploads\n"
+                    for title, video_id, upload_time, video_url in recent_uploads:
+                        report += f"- **{title}** ([{video_id}]({video_url})) - {upload_time}\n"
+                    report += "\n"
+                
+                if failed_uploads:
+                    report += "### ❌ Failed Uploads Needing Attention\n"
+                    for title, error, attempts, last_attempt in failed_uploads:
+                        report += f"- **{title}** - {attempts} attempts - Last: {last_attempt}\n"
+                        report += f"  Error: {error[:100]}...\n"
+                    report += "\n"
+                
+                with open('upload_report.md', 'w') as f:
+                    f.write(report)
+                
+                conn.close()
+                print("✅ Upload report generated")
+                
+            except Exception as e:
+                print(f"⚠️ Could not generate upload report: {e}")
+                with open('upload_report.md', 'w') as f:
+                    f.write("## Upload Report\nNo data available.\n")
+
+        generate_upload_report()
+        EOF
+
+    - name: 📤 Upload Database and Logs
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: youtube-upload-data-${{ github.run_id }}
+        path: |
+          youtube_uploads.db
+          logs/youtube_upload.log
+          upload_report.md
+        retention-days: 30
+
+    - name: 💾 Commit Upload Database
+      if: success() && (steps.upload_video.outputs.video_id != '' || steps.upload_video.outputs.uploaded_count > 0)
+      run: |
+        # Configure git
+        git config --local user.email "action@github.com"
+        git config --local user.name "YouTube Upload Bot"
+        
+        # Add database file
+        if [[ -f youtube_uploads.db ]]; then
+          git add youtube_uploads.db
+          
+          # Create commit message based on upload results
+          if [[ "${{ steps.upload_video.outputs.video_id }}" != "" ]]; then
+            COMMIT_MSG="📹 Upload complete: ${{ steps.upload_video.outputs.video_id }} - ${{ github.event.inputs.title }}"
+          else
+            UPLOADED="${{ steps.upload_video.outputs.uploaded_count }}"
+            FAILED="${{ steps.upload_video.outputs.failed_count }}"
+            COMMIT_MSG="📊 Batch upload: ${UPLOADED} successful, ${FAILED} failed"
+          fi
+          
+          # Commit and push if there are changes
+          if ! git diff --cached --quiet; then
+            git commit -m "${COMMIT_MSG}" || echo "No changes to commit"
+            git push origin main || echo "Push failed - continuing anyway"
+          fi
+        fi
+
+    - name: 📈 Update Step Summary
+      if: always()
+      run: |
+        echo "## 🎬 YouTube Upload Results" >> $GITHUB_STEP_SUMMARY
+        
+        if [[ "${{ steps.upload_video.outputs.upload_status }}" == "success" ]]; then
+          echo "### ✅ Upload Successful!" >> $GITHUB_STEP_SUMMARY
+          echo "- **Video ID**: ${{ steps.upload_video.outputs.video_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Video URL**: ${{ steps.upload_video.outputs.video_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Title**: ${{ github.event.inputs.title }}" >> $GITHUB_STEP_SUMMARY
+        elif [[ "${{ steps.upload_video.outputs.uploaded_count }}" != "" ]]; then
+          echo "### 📊 Batch Processing Results" >> $GITHUB_STEP_SUMMARY
+          echo "- **Uploaded**: ${{ steps.upload_video.outputs.uploaded_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Failed**: ${{ steps.upload_video.outputs.failed_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total Processed**: ${{ steps.upload_video.outputs.total_processed }}" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "### ❌ Upload Failed" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ steps.upload_video.outputs.upload_status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Error**: ${{ steps.upload_video.outputs.error_message }}" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📋 Configuration Used" >> $GITHUB_STEP_SUMMARY
+        echo "- **Privacy**: ${{ github.event.inputs.privacy || 'public' }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Scheduled**: ${{ github.event.inputs.scheduled_time || 'Immediate' }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Playlist**: ${{ github.event.inputs.playlist_id || 'None' }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Retry Attempts**: ${{ github.event.inputs.retry_count || '3' }}" >> $GITHUB_STEP_SUMMARY
+        
+        # Add report if it exists
+        if [[ -f upload_report.md ]]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          cat upload_report.md >> $GITHUB_STEP_SUMMARY
+        fi
+
+  # Use reusable notification workflow
+  notify-completion:
+    name: 📢 Send Notifications
+    needs: youtube-upload
+    if: always()
+    uses: ./.github/workflows/reusable-notify.yml
+    with:
+      status: ${{ needs.youtube-upload.result }}
+      workflow-name: 'YouTube Upload & Scheduling'
+      details: |
+        Video: ${{ github.event.inputs.title || 'Batch Upload' }}
+        Status: ${{ needs.youtube-upload.result }}
+        Video ID: ${{ needs.youtube-upload.outputs.video_id || 'N/A' }}
+        Upload Count: ${{ needs.youtube-upload.outputs.uploaded_count || '0' }}
+        Failed Count: ${{ needs.youtube-upload.outputs.failed_count || '0' }}
+      slack-enabled: true
+      discord-enabled: false
+    secrets:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+# Prevent concurrent uploads
+concurrency:
+  group: youtube-upload
+  cancel-in-progress: false

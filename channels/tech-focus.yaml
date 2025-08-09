@@ -1,0 +1,134 @@
+# Tech-Focused YouTube Channel Configuration
+channel_id: tech-focus
+channel_name: "TechSphere AI"
+
+# Platform Configuration
+platform:
+  youtube:
+    enabled: true
+    channel_id: "UCxxxxxxxxxxxxxxxxxxx"
+    upload_defaults:
+      privacy: "public"
+      category_id: 28  # Science & Technology
+      language: "en"
+      license: "youtube"
+      embeddable: true
+    scheduling:
+      upload_time: "10:00"  # 10 AM UTC
+      frequency: "daily"
+      max_uploads_per_day: 2
+  
+  tiktok:
+    enabled: true
+    username: "techsphere_ai"
+    upload_defaults:
+      privacy: "public_to_everyone"
+      allow_comments: true
+      allow_duet: true
+      allow_stitch: true
+    scheduling:
+      upload_time: "18:00"  # 6 PM UTC
+      frequency: "daily"
+      max_uploads_per_day: 3
+
+# Content Configuration
+content:
+  niche: "technology"
+  target_audience: "tech_enthusiasts"
+  content_types:
+    - "ai_explanations"
+    - "coding_tutorials"
+    - "tech_reviews"
+    - "future_predictions"
+  
+  video_specs:
+    youtube:
+      duration: [300, 900]  # 5-15 minutes
+      resolution: "1920x1080"
+      fps: 30
+      format: "mp4"
+    tiktok:
+      duration: [15, 180]  # 15s-3min
+      resolution: "1080x1920"  # Vertical
+      fps: 30
+      format: "mp4"
+
+# SEO & Optimization
+seo:
+  keywords:
+    primary: ["artificial intelligence", "machine learning", "coding", "tech tutorials"]
+    secondary: ["programming", "software development", "tech news", "innovation"]
+  
+  hashtags:
+    youtube: ["#AI", "#MachineLearning", "#TechTutorial", "#Coding", "#Programming"]
+    tiktok: ["#TechTok", "#AIExplained", "#CodingLife", "#TechTrends", "#Innovation"]
+
+# Revenue Configuration
+monetization:
+  youtube:
+    ads_enabled: true
+    sponsorships: true
+    memberships: true
+    super_chat: true
+    merch_shelf: true
+  
+  affiliate_marketing:
+    enabled: true
+    networks: ["amazon_associates", "tech_affiliate_programs"]
+  
+  courses:
+    enabled: true
+    platforms: ["udemy", "coursera", "skillshare"]
+
+# Compliance & Safety
+compliance:
+  content_policy:
+    copyright_check: true
+    profanity_filter: true
+    coppa_compliant: true
+    advertiser_friendly: true
+  
+  safety_checks:
+    - "copyright_detection"
+    - "profanity_check"
+    - "spam_detection"
+    - "misinformation_check"
+  
+  upload_restrictions:
+    max_file_size: "2GB"
+    supported_formats: ["mp4", "mov", "avi"]
+    thumbnail_requirements:
+      resolution: "1280x720"
+      aspect_ratio: "16:9"
+      format: "jpg"
+
+# Analytics & Tracking
+analytics:
+  tracking_enabled: true
+  metrics_to_track:
+    - "view_count"
+    - "engagement_rate"
+    - "subscriber_growth"
+    - "revenue"
+    - "audience_retention"
+  
+  reporting:
+    frequency: "daily"
+    dashboard_enabled: true
+    alerts:
+      low_performance: true
+      high_performance: true
+      policy_violations: true
+
+# Worker Configuration for Scaling
+scaling:
+  worker_config:
+    max_concurrent_uploads: 3
+    queue_priority: "high"
+    retry_attempts: 3
+    timeout: 300  # 5 minutes
+  
+  resource_limits:
+    memory_limit: "2GB"
+    cpu_limit: "2 cores"
+    storage_limit: "50GB"

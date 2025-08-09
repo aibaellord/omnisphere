@@ -1,0 +1,288 @@
+name: 📈 Collect YouTube Analytics
+
+on:
+  # Daily analytics collection at 2 AM UTC
+  schedule:
+    - cron: '0 2 * * *'
+  
+  # Manual triggering
+  workflow_dispatch:
+    inputs:
+      date_range:
+        description: 'Number of days to collect (default: 7)'
+        required: false
+        default: '7'
+      include_video_analytics:
+        description: 'Include individual video analytics'
+        required: false
+        type: boolean
+        default: true
+      force_refresh:
+        description: 'Force refresh of existing data'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  PYTHON_VERSION: '3.10'
+
+jobs:
+  collect-analytics:
+    name: 📊 YouTube Analytics Collection
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    steps:
+    - name: 📥 Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: 🔧 Setup Environment
+      uses: ./.github/workflows/reusable-setup.yml
+      with:
+        install-extras: 'google-auth google-auth-oauthlib google-api-python-client pandas'
+
+    - name: 📁 Create Analytics Directory
+      run: |
+        mkdir -p data/analytics
+        mkdir -p logs
+
+    - name: 📊 Collect YouTube Analytics
+      id: analytics
+      run: |
+        python -c "
+        import os
+        import sys
+        sys.path.append('.')
+        from analytics_collector import YouTubeAnalyticsCollector
+        from datetime import datetime, timedelta
+        import json
+        
+        try:
+            # Initialize collector
+            collector = YouTubeAnalyticsCollector(
+                db_path='analytics_data.db'
+            )
+            
+            # Configuration
+            date_range = int('${{ github.event.inputs.date_range }}' or '7')
+            include_videos = '${{ github.event.inputs.include_video_analytics }}' == 'true'
+            force_refresh = '${{ github.event.inputs.force_refresh }}' == 'true'
+            
+            print(f'📈 Starting analytics collection...')
+            print(f'📅 Date range: {date_range} days')
+            print(f'🎥 Include videos: {include_videos}')
+            print(f'🔄 Force refresh: {force_refresh}')
+            
+            # Collect channel analytics
+            channel_results = collector.collect_channel_analytics(
+                days_back=date_range,
+                force_refresh=force_refresh
+            )
+            
+            print(f'✅ Channel analytics: {len(channel_results)} records')
+            
+            videos_collected = 0
+            if include_videos:
+                # Collect video analytics
+                video_results = collector.collect_video_analytics(
+                    days_back=date_range,
+                    force_refresh=force_refresh
+                )
+                videos_collected = len(video_results)
+                print(f'✅ Video analytics: {videos_collected} records')
+            
+            # Generate summary
+            total_records = len(channel_results) + videos_collected
+            print(f'📊 Total records collected: {total_records}')
+            
+            # Set outputs
+            print(f'::set-output name=channel_records::{len(channel_results)}')
+            print(f'::set-output name=video_records::{videos_collected}')
+            print(f'::set-output name=total_records::{total_records}')
+            print('::set-output name=status::success')
+            
+        except Exception as e:
+            error_msg = str(e)
+            print(f'❌ Analytics collection failed: {error_msg}')
+            print(f'::set-output name=status::failed')
+            print(f'::set-output name=error::{error_msg}')
+            sys.exit(1)
+        "
+      env:
+        GOOGLE_OAUTH_CREDENTIALS: ${{ secrets.GOOGLE_OAUTH_CREDENTIALS }}
+        GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+
+    - name: 📋 Generate Analytics Report
+      if: always()
+      run: |
+        python -c "
+        import sqlite3
+        import json
+        from datetime import datetime, timedelta
+        import os
+        
+        def generate_analytics_report():
+            try:
+                conn = sqlite3.connect('analytics_data.db')
+                cursor = conn.cursor()
+                
+                # Get recent channel analytics
+                cursor.execute('''
+                SELECT date, views, watch_time_minutes, estimated_revenue, rpm, subscribers_gained
+                FROM channel_analytics 
+                WHERE date >= date('now', '-7 days')
+                ORDER BY date DESC
+                ''')
+                
+                channel_data = cursor.fetchall()
+                
+                # Get top performing videos (last 7 days)
+                cursor.execute('''
+                SELECT video_id, date, views, estimated_revenue, average_view_duration
+                FROM video_analytics 
+                WHERE date >= date('now', '-7 days')
+                ORDER BY views DESC 
+                LIMIT 10
+                ''')
+                
+                video_data = cursor.fetchall()
+                
+                # Generate markdown report
+                report = '## 📈 YouTube Analytics Report\\n\\n'
+                
+                if channel_data:
+                    report += '### 📊 Channel Performance (Last 7 Days)\\n\\n'
+                    report += '| Date | Views | Watch Time | Revenue | RPM | Subscribers |\\n'
+                    report += '|------|-------|------------|---------|-----|-------------|\\n'
+                    
+                    total_views = 0
+                    total_revenue = 0.0
+                    
+                    for date, views, watch_time, revenue, rpm, subs in channel_data:
+                        total_views += views or 0
+                        total_revenue += revenue or 0.0
+                        report += f'| {date} | {views:,} | {watch_time:,} min | ${revenue:.2f} | ${rpm:.2f} | +{subs} |\\n'
+                    
+                    report += f'\\n**Totals**: {total_views:,} views, ${total_revenue:.2f} revenue\\n\\n'
+                
+                if video_data:
+                    report += '### 🎥 Top Performing Videos\\n\\n'
+                    report += '| Video ID | Date | Views | Revenue | Avg Duration |\\n'
+                    report += '|----------|------|-------|---------|--------------|\\n'
+                    
+                    for video_id, date, views, revenue, duration in video_data:
+                        report += f'| {video_id} | {date} | {views:,} | ${revenue:.2f} | {duration:.1f}s |\\n'
+                    
+                    report += '\\n'
+                
+                # Database stats
+                cursor.execute('SELECT COUNT(*) FROM channel_analytics')
+                channel_count = cursor.fetchone()[0]
+                
+                cursor.execute('SELECT COUNT(*) FROM video_analytics')  
+                video_count = cursor.fetchone()[0]
+                
+                report += f'### 💾 Database Statistics\\n\\n'
+                report += f'- **Channel Records**: {channel_count:,}\\n'
+                report += f'- **Video Records**: {video_count:,}\\n'
+                report += f'- **Last Updated**: {datetime.now().strftime(\"%Y-%m-%d %H:%M UTC\")}\\n'
+                
+                with open('analytics_report.md', 'w') as f:
+                    f.write(report)
+                
+                conn.close()
+                print('✅ Analytics report generated')
+                
+            except Exception as e:
+                print(f'⚠️ Could not generate analytics report: {e}')
+                with open('analytics_report.md', 'w') as f:
+                    f.write('## Analytics Report\\nNo data available.\\n')
+        
+        generate_analytics_report()
+        "
+
+    - name: 📤 Upload Analytics Artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: analytics-data-${{ github.run_id }}
+        path: |
+          analytics_data.db
+          data/analytics/**
+          analytics_report.md
+          logs/**
+        retention-days: 30
+
+    - name: 💾 Commit Analytics Database
+      if: success()
+      run: |
+        # Configure git
+        git config --local user.email "action@github.com"
+        git config --local user.name "Analytics Bot"
+        
+        # Add analytics database
+        if [[ -f analytics_data.db ]]; then
+          git add analytics_data.db
+          
+          # Only commit if there are changes
+          if ! git diff --cached --quiet; then
+            RECORDS="${{ steps.analytics.outputs.total_records }}"
+            git commit -m "📊 Analytics update: ${RECORDS} records collected $(date -u '+%Y-%m-%d %H:%M UTC')" || echo "No changes to commit"
+            git push origin main || echo "Push failed - continuing anyway"
+          else
+            echo "No analytics changes to commit"
+          fi
+        fi
+
+    - name: 📈 Update Step Summary
+      if: always()
+      run: |
+        echo "## 📈 YouTube Analytics Results" >> $GITHUB_STEP_SUMMARY
+        
+        if [[ "${{ steps.analytics.outputs.status }}" == "success" ]]; then
+          echo "### ✅ Collection Successful!" >> $GITHUB_STEP_SUMMARY
+          echo "- **Channel Records**: ${{ steps.analytics.outputs.channel_records }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Video Records**: ${{ steps.analytics.outputs.video_records }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total Records**: ${{ steps.analytics.outputs.total_records }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Date Range**: ${{ github.event.inputs.date_range || '7' }} days" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "### ❌ Collection Failed" >> $GITHUB_STEP_SUMMARY
+          echo "- **Error**: ${{ steps.analytics.outputs.error }}" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📋 Configuration" >> $GITHUB_STEP_SUMMARY
+        echo "- **Include Videos**: ${{ github.event.inputs.include_video_analytics || 'true' }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Force Refresh**: ${{ github.event.inputs.force_refresh || 'false' }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Collection Time**: $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+        
+        # Add report if it exists
+        if [[ -f analytics_report.md ]]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          cat analytics_report.md >> $GITHUB_STEP_SUMMARY
+        fi
+
+  # Use reusable notification workflow
+  notify-completion:
+    name: 📢 Send Notifications
+    needs: collect-analytics
+    if: always()
+    uses: ./.github/workflows/reusable-notify.yml
+    with:
+      status: ${{ needs.collect-analytics.result }}
+      workflow-name: 'YouTube Analytics Collection'
+      details: |
+        Status: ${{ needs.collect-analytics.result }}
+        Channel Records: ${{ needs.collect-analytics.outputs.channel_records || '0' }}
+        Video Records: ${{ needs.collect-analytics.outputs.video_records || '0' }}
+        Total Records: ${{ needs.collect-analytics.outputs.total_records || '0' }}
+        Date Range: ${{ github.event.inputs.date_range || '7' }} days
+      slack-enabled: true
+      discord-enabled: false
+    secrets:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+concurrency:
+  group: analytics-collection
+  cancel-in-progress: false

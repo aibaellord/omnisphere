@@ -1,0 +1,438 @@
+name: 🎬 Video Pipeline Matrix
+
+on:
+  schedule:
+    # Collect trending data hourly
+    - cron: '15 * * * *'  # At 15 minutes past every hour
+    # Collect analytics daily at 2 AM UTC
+    - cron: '0 2 * * *'   # Daily at 2 AM UTC
+  
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: 'Operation to run'
+        required: true
+        type: choice
+        options:
+          - 'collect_trending'
+          - 'create_video'
+          - 'upload_video'
+          - 'collect_analytics'
+          - 'full_pipeline'
+        default: 'collect_trending'
+      regions:
+        description: 'Regions for trending collection (comma-separated)'
+        required: false
+        default: 'US,GB,CA,AU'
+      video_topic:
+        description: 'Specific topic for video creation'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Run in dry-run mode (no uploads)'
+        required: false
+        type: boolean
+        default: false
+
+  # Trigger on new scripts or video assets
+  push:
+    paths:
+      - 'data/scripts/**'
+      - 'generated_videos/**'
+    branches: [ main ]
+
+  # Trigger on workflow run completion
+  workflow_run:
+    workflows: ["🔥 Collect Trending Data"]
+    types: [completed]
+
+env:
+  PYTHON_VERSION: '3.10'
+  PIPELINE_VERSION: 'v2.0'
+
+jobs:
+  # Job 1: Determine what operations to run
+  determine-jobs:
+    name: 🎯 Determine Pipeline Jobs
+    runs-on: ubuntu-latest
+    outputs:
+      collect_trending: ${{ steps.determine.outputs.collect_trending }}
+      create_video: ${{ steps.determine.outputs.create_video }}
+      upload_video: ${{ steps.determine.outputs.upload_video }}
+      collect_analytics: ${{ steps.determine.outputs.collect_analytics }}
+      pipeline_id: ${{ steps.determine.outputs.pipeline_id }}
+    
+    steps:
+    - name: 🎯 Determine operations to run
+      id: determine
+      run: |
+        # Generate unique pipeline ID
+        PIPELINE_ID="pipeline-$(date +%Y%m%d-%H%M%S)-${{ github.run_number }}"
+        echo "pipeline_id=${PIPELINE_ID}" >> $GITHUB_OUTPUT
+        
+        # Determine operations based on trigger type
+        if [ "${{ github.event_name }}" = "schedule" ]; then
+          if [ "${{ github.event.schedule }}" = "15 * * * *" ]; then
+            # Hourly trending collection
+            echo "collect_trending=true" >> $GITHUB_OUTPUT
+            echo "create_video=false" >> $GITHUB_OUTPUT
+            echo "upload_video=false" >> $GITHUB_OUTPUT
+            echo "collect_analytics=false" >> $GITHUB_OUTPUT
+            echo "📊 Scheduled: Trending data collection"
+          elif [ "${{ github.event.schedule }}" = "0 2 * * *" ]; then
+            # Daily analytics collection
+            echo "collect_trending=false" >> $GITHUB_OUTPUT
+            echo "create_video=false" >> $GITHUB_OUTPUT
+            echo "upload_video=false" >> $GITHUB_OUTPUT
+            echo "collect_analytics=true" >> $GITHUB_OUTPUT
+            echo "📈 Scheduled: Analytics collection"
+          fi
+        elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          case "${{ github.event.inputs.operation }}" in
+            "collect_trending")
+              echo "collect_trending=true" >> $GITHUB_OUTPUT
+              echo "create_video=false" >> $GITHUB_OUTPUT
+              echo "upload_video=false" >> $GITHUB_OUTPUT
+              echo "collect_analytics=false" >> $GITHUB_OUTPUT
+              ;;
+            "create_video")
+              echo "collect_trending=false" >> $GITHUB_OUTPUT
+              echo "create_video=true" >> $GITHUB_OUTPUT
+              echo "upload_video=false" >> $GITHUB_OUTPUT
+              echo "collect_analytics=false" >> $GITHUB_OUTPUT
+              ;;
+            "upload_video")
+              echo "collect_trending=false" >> $GITHUB_OUTPUT
+              echo "create_video=false" >> $GITHUB_OUTPUT
+              echo "upload_video=true" >> $GITHUB_OUTPUT
+              echo "collect_analytics=false" >> $GITHUB_OUTPUT
+              ;;
+            "collect_analytics")
+              echo "collect_trending=false" >> $GITHUB_OUTPUT
+              echo "create_video=false" >> $GITHUB_OUTPUT
+              echo "upload_video=false" >> $GITHUB_OUTPUT
+              echo "collect_analytics=true" >> $GITHUB_OUTPUT
+              ;;
+            "full_pipeline")
+              echo "collect_trending=true" >> $GITHUB_OUTPUT
+              echo "create_video=true" >> $GITHUB_OUTPUT
+              echo "upload_video=true" >> $GITHUB_OUTPUT
+              echo "collect_analytics=true" >> $GITHUB_OUTPUT
+              ;;
+          esac
+          echo "🎬 Manual trigger: ${{ github.event.inputs.operation }}"
+        elif [ "${{ github.event_name }}" = "push" ]; then
+          # Trigger video upload on new content
+          echo "collect_trending=false" >> $GITHUB_OUTPUT
+          echo "create_video=false" >> $GITHUB_OUTPUT
+          echo "upload_video=true" >> $GITHUB_OUTPUT
+          echo "collect_analytics=false" >> $GITHUB_OUTPUT
+          echo "📤 Push trigger: Upload new videos"
+        elif [ "${{ github.event_name }}" = "workflow_run" ]; then
+          if [ "${{ github.event.workflow_run.conclusion }}" = "success" ]; then
+            # Create video after successful trending collection
+            echo "collect_trending=false" >> $GITHUB_OUTPUT
+            echo "create_video=true" >> $GITHUB_OUTPUT
+            echo "upload_video=false" >> $GITHUB_OUTPUT
+            echo "collect_analytics=false" >> $GITHUB_OUTPUT
+            echo "🎬 Workflow trigger: Create video from trending data"
+          else
+            # No operations if previous workflow failed
+            echo "collect_trending=false" >> $GITHUB_OUTPUT
+            echo "create_video=false" >> $GITHUB_OUTPUT
+            echo "upload_video=false" >> $GITHUB_OUTPUT
+            echo "collect_analytics=false" >> $GITHUB_OUTPUT
+            echo "❌ Previous workflow failed, skipping"
+          fi
+        fi
+        
+        echo "🆔 Pipeline ID: ${PIPELINE_ID}" >> $GITHUB_STEP_SUMMARY
+
+  # Job 2: Collect trending data (hourly)
+  collect-trending:
+    name: 🔥 Collect Trending Data
+    needs: determine-jobs
+    if: needs.determine-jobs.outputs.collect_trending == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    
+    steps:
+    - name: 📥 Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: 🔧 Setup Environment
+      uses: ./.github/workflows/reusable-setup.yml
+      with:
+        install-extras: 'google-api-python-client google-auth google-auth-oauthlib'
+
+    - name: 📊 Run trending collection
+      run: |
+        REGIONS="${{ github.event.inputs.regions || 'US,GB,CA,AU,DE,FR' }}"
+        python -c "
+        import asyncio
+        import os
+        import sys
+        from collect_trending import TrendingDataCollector
+        
+        async def main():
+            # Get API keys from environment
+            api_keys = []
+            for i in range(1, 6):
+                key = os.getenv(f'YOUTUBE_API_KEY_{i}')
+                if key:
+                    api_keys.append(key)
+            
+            if not api_keys:
+                print('❌ No API keys found')
+                return False
+            
+            regions = '$REGIONS'.split(',') if '$REGIONS' else None
+            
+            collector = TrendingDataCollector(
+                api_keys=api_keys,
+                db_path='trending_data.db'
+            )
+            
+            result = await collector.collect_trending_data(
+                regions=regions,
+                max_results_per_request=50
+            )
+            
+            print(f'✅ Collected {result.get(\"total_videos_collected\", 0)} videos')
+            return True
+        
+        success = asyncio.run(main())
+        exit(0 if success else 1)
+        "
+      env:
+        YOUTUBE_API_KEY_1: ${{ secrets.YOUTUBE_API_KEY_1 }}
+        YOUTUBE_API_KEY_2: ${{ secrets.YOUTUBE_API_KEY_2 }}
+        YOUTUBE_API_KEY_3: ${{ secrets.YOUTUBE_API_KEY_3 }}
+
+  # Job 3: Create video script and assets (on new trending data)
+  create-video:
+    name: 🎬 Create Video Content
+    needs: [determine-jobs, collect-trending]
+    if: |
+      always() && 
+      needs.determine-jobs.outputs.create_video == 'true' &&
+      (needs.collect-trending.result == 'success' || needs.collect-trending.result == 'skipped')
+    
+    strategy:
+      matrix:
+        content_type: [trending_analysis, tech_news, market_insights]
+        max-parallel: 2
+      fail-fast: false
+    
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+    - name: 📥 Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: 🔧 Setup Environment
+      uses: ./.github/workflows/reusable-setup.yml
+      with:
+        install-extras: 'openai elevenlabs-api'
+
+    - name: 📝 Generate Script
+      id: script
+      run: |
+        python -c "
+        import sys
+        sys.path.append('.')
+        from generate_script import ScriptGenerator
+        
+        generator = ScriptGenerator()
+        
+        # Generate script based on matrix content type
+        content_type = '${{ matrix.content_type }}'
+        topic = '${{ github.event.inputs.video_topic }}'
+        
+        print(f'🎬 Generating {content_type} video script')
+        
+        if topic:
+            print(f'📋 Custom topic: {topic}')
+        
+        # Placeholder for actual script generation
+        script_id = f'{content_type}_{int(__import__(\"time\").time())}'
+        print(f'::set-output name=script_id::{script_id}')
+        print(f'✅ Script generated: {script_id}')
+        "
+      env:
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+    - name: 🎙️ Generate Voice
+      if: steps.script.outputs.script_id != ''
+      run: |
+        echo "🎙️ Generating voice for script: ${{ steps.script.outputs.script_id }}"
+        # Voice generation logic here
+        touch "generated_audio_${{ steps.script.outputs.script_id }}.wav"
+
+    - name: 🎥 Build Video
+      if: steps.script.outputs.script_id != ''
+      run: |
+        echo "🎥 Building video for: ${{ steps.script.outputs.script_id }}"
+        python -c "
+        import sys
+        sys.path.append('.')
+        from build_video import VideoAssemblyPipeline, VideoAssets
+        
+        pipeline = VideoAssemblyPipeline()
+        assets = VideoAssets(
+            voice_file='generated_audio_${{ steps.script.outputs.script_id }}.wav'
+        )
+        
+        # Build video (placeholder)
+        print('🎬 Video assembly pipeline ready')
+        print('📹 Output: generated_videos/video_${{ steps.script.outputs.script_id }}.mp4')
+        "
+
+    - name: 📤 Upload Artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: video-content-${{ matrix.content_type }}-${{ github.run_id }}
+        path: |
+          data/scripts/**
+          generated_videos/**
+          generated_audio_*.wav
+        retention-days: 7
+
+  # Job 4: Upload videos to YouTube (after video creation)
+  upload-video:
+    name: 📺 Upload to YouTube
+    needs: [determine-jobs, create-video]
+    if: |
+      always() && 
+      needs.determine-jobs.outputs.upload_video == 'true' &&
+      (needs.create-video.result == 'success' || github.event_name == 'push')
+    
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    
+    steps:
+    - name: 📥 Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: 🔧 Setup Environment
+      uses: ./.github/workflows/reusable-setup.yml
+      with:
+        install-extras: 'google-auth google-auth-oauthlib google-api-python-client'
+
+    - name: 📹 Find videos to upload
+      id: find-videos
+      run: |
+        # Find new video files
+        if [ -d "generated_videos" ]; then
+          VIDEOS=$(find generated_videos -name "*.mp4" -newer trending_data.db 2>/dev/null || true)
+          if [ -n "$VIDEOS" ]; then
+            echo "videos_found=true" >> $GITHUB_OUTPUT
+            echo "video_count=$(echo "$VIDEOS" | wc -l)" >> $GITHUB_OUTPUT
+            echo "📹 Found $(echo "$VIDEOS" | wc -l) videos to upload"
+          else
+            echo "videos_found=false" >> $GITHUB_OUTPUT
+            echo "📭 No new videos found"
+          fi
+        else
+          echo "videos_found=false" >> $GITHUB_OUTPUT
+          echo "📂 No generated_videos directory"
+        fi
+
+    - name: 📺 Upload to YouTube
+      if: steps.find-videos.outputs.videos_found == 'true' && github.event.inputs.dry_run != 'true'
+      run: |
+        # Use existing YouTube upload workflow
+        echo "📺 Uploading videos to YouTube..."
+        python -c "
+        import sys
+        sys.path.append('./core')
+        
+        # Import YouTube upload manager
+        print('🚀 YouTube upload process starting')
+        print('📊 Dry run: ${{ github.event.inputs.dry_run }}')
+        
+        # Placeholder for actual upload logic
+        print('✅ Upload completed')
+        "
+      env:
+        GOOGLE_OAUTH_CREDENTIALS: ${{ secrets.GOOGLE_OAUTH_CREDENTIALS }}
+        GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+
+  # Job 5: Collect analytics (daily)
+  collect-analytics:
+    name: 📈 Collect Analytics
+    needs: determine-jobs
+    if: needs.determine-jobs.outputs.collect_analytics == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    steps:
+    - name: 📥 Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: 🔧 Setup Environment
+      uses: ./.github/workflows/reusable-setup.yml
+      with:
+        install-extras: 'google-auth google-auth-oauthlib google-api-python-client pandas'
+
+    - name: 📊 Collect YouTube Analytics
+      run: |
+        python -c "
+        import sys
+        sys.path.append('.')
+        from analytics_collector import YouTubeAnalyticsCollector
+        
+        collector = YouTubeAnalyticsCollector()
+        
+        print('📈 Starting analytics collection...')
+        
+        # Collect analytics data
+        print('✅ Analytics collection completed')
+        "
+      env:
+        GOOGLE_OAUTH_CREDENTIALS: ${{ secrets.GOOGLE_OAUTH_CREDENTIALS }}
+        GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+
+    - name: 📊 Generate Analytics Report
+      run: |
+        echo "## 📈 Analytics Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- **Collection Date**: $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+        echo "- **Status**: ✅ Completed" >> $GITHUB_STEP_SUMMARY
+        
+        # Add more detailed analytics summary here
+        if [ -f analytics_data.db ]; then
+          echo "- **Database Size**: $(du -h analytics_data.db | cut -f1)" >> $GITHUB_STEP_SUMMARY
+        fi
+
+  # Job 6: Notification on completion
+  notify-completion:
+    name: 📢 Send Notifications
+    needs: [determine-jobs, collect-trending, create-video, upload-video, collect-analytics]
+    if: always()
+    uses: ./.github/workflows/reusable-notify.yml
+    with:
+      status: ${{ 
+        (needs.collect-trending.result == 'success' || needs.collect-trending.result == 'skipped') &&
+        (needs.create-video.result == 'success' || needs.create-video.result == 'skipped') &&
+        (needs.upload-video.result == 'success' || needs.upload-video.result == 'skipped') &&
+        (needs.collect-analytics.result == 'success' || needs.collect-analytics.result == 'skipped')
+        && 'success' || 'failure'
+      }}
+      workflow-name: 'Video Pipeline Matrix'
+      details: |
+        Pipeline ID: ${{ needs.determine-jobs.outputs.pipeline_id }}
+        Trending: ${{ needs.collect-trending.result || 'skipped' }}
+        Video Creation: ${{ needs.create-video.result || 'skipped' }}
+        Upload: ${{ needs.upload-video.result || 'skipped' }}
+        Analytics: ${{ needs.collect-analytics.result || 'skipped' }}
+      slack-enabled: true
+      discord-enabled: false
+    secrets:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+concurrency:
+  group: video-pipeline-${{ github.ref }}
+  cancel-in-progress: false

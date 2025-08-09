@@ -1,0 +1,109 @@
+name: 🔧 Reusable Setup
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: 'Python version to use'
+        required: false
+        type: string
+        default: '3.10'
+      cache-dependency-path:
+        description: 'Path to requirements file for cache key'
+        required: false
+        type: string
+        default: '**/requirements*.txt'
+      install-extras:
+        description: 'Additional packages to install'
+        required: false
+        type: string
+        default: ''
+      working-directory:
+        description: 'Working directory for the workflow'
+        required: false
+        type: string
+        default: '.'
+    outputs:
+      cache-hit:
+        description: 'Whether pip cache was hit'
+        value: ${{ jobs.setup.outputs.cache-hit }}
+      python-path:
+        description: 'Python executable path'
+        value: ${{ jobs.setup.outputs.python-path }}
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      cache-hit: ${{ steps.cache-pip.outputs.cache-hit }}
+      python-path: ${{ steps.setup-python.outputs.python-path }}
+    
+    steps:
+    - name: 📥 Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: 🐍 Set up Python
+      id: setup-python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: 📦 Get pip cache directory
+      id: pip-cache-dir
+      run: |
+        echo "dir=$(pip cache dir)" >> $GITHUB_OUTPUT
+
+    - name: 💾 Cache pip dependencies
+      id: cache-pip
+      uses: actions/cache@v3
+      with:
+        path: ${{ steps.pip-cache-dir.outputs.dir }}
+        key: ${{ runner.os }}-pip-${{ inputs.python-version }}-${{ hashFiles(inputs.cache-dependency-path) }}
+        restore-keys: |
+          ${{ runner.os }}-pip-${{ inputs.python-version }}-
+          ${{ runner.os }}-pip-
+
+    - name: 🔧 Install base dependencies
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        python -m pip install --upgrade pip wheel setuptools
+        if [ -f requirements.txt ]; then
+          pip install -r requirements.txt
+        elif [ -f requirements-core.txt ]; then
+          pip install -r requirements-core.txt
+        fi
+
+    - name: 📦 Install additional packages
+      if: ${{ inputs.install-extras != '' }}
+      run: |
+        pip install ${{ inputs.install-extras }}
+
+    - name: 📝 Log installed packages
+      run: |
+        echo "## 📦 Installed Packages" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        pip list >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
+    - name: 🔍 Verify installation
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        python -c "
+        import sys
+        print(f'Python version: {sys.version}')
+        print(f'Python path: {sys.executable}')
+        
+        # Test core imports
+        try:
+            import pandas, numpy, requests, openai
+            print('✅ Core dependencies imported successfully')
+        except ImportError as e:
+            print(f'⚠️ Import warning: {e}')
+        
+        # Test Google API imports
+        try:
+            import googleapiclient.discovery
+            print('✅ Google API client imported successfully')
+        except ImportError as e:
+            print(f'⚠️ Google API import warning: {e}')
+        "

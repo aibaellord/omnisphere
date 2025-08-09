@@ -1,0 +1,92 @@
+# Render.com Deployment Configuration for OmniSphere Scaling
+# Free tier supports 750 hours/month across all services
+
+services:
+  # Main application service
+  - type: web
+    name: omnisphere-api
+    runtime: python3
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m uvicorn core.api_server:app --host 0.0.0.0 --port $PORT
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: omnisphere-redis
+          property: connectionString
+      - key: OPENAI_API_KEY
+        sync: false  # Set manually in dashboard
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false  # Set manually if using Upstash
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false  # Set manually if using Upstash
+    
+  # Worker service for task processing
+  - type: worker
+    name: omnisphere-worker-1
+    runtime: python3
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -c "from core.scaling_orchestrator import ScalingOrchestrator; orchestrator = ScalingOrchestrator(); orchestrator.scale_system(30, 'cost'); import time; time.sleep(3600)"
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: omnisphere-redis
+          property: connectionString
+      - key: WORKER_NAME
+        value: render-worker-1
+      - key: WORKER_QUEUES
+        value: high,medium
+      - key: OPENAI_API_KEY
+        sync: false
+    
+  # Additional worker for scaling
+  - type: worker
+    name: omnisphere-worker-2
+    runtime: python3
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -c "from core.task_queue_manager import TaskQueueManager; queue_manager = TaskQueueManager(); queue_manager.start_worker(['medium', 'low'], 'render-worker-2'); import time; time.sleep(3600)"
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: omnisphere-redis
+          property: connectionString
+      - key: WORKER_NAME
+        value: render-worker-2
+      - key: WORKER_QUEUES
+        value: medium,low
+      - key: OPENAI_API_KEY
+        sync: false
+
+databases:
+  # Redis for task queuing (free tier: 30MB storage)
+  - name: omnisphere-redis
+    plan: free
+    databaseName: omnisphere_queue
+
+# Environment variables to set in Render dashboard:
+# - OPENAI_API_KEY: Your OpenAI API key
+# - YOUTUBE_API_KEY: Your YouTube Data API key (optional)
+# - UPSTASH_REDIS_REST_URL: If using Upstash instead of Render Redis
+# - UPSTASH_REDIS_REST_TOKEN: If using Upstash instead of Render Redis
+
+# Deployment Notes:
+# 1. Free tier provides 750 hours/month total across all services
+# 2. Services will sleep after 15 minutes of inactivity
+# 3. First request after sleep may take 30+ seconds to wake up
+# 4. Consider upgrading to paid plans for production use
+# 5. Set up monitoring and alerts for service health
